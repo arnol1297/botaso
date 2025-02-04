@@ -1,0 +1,439 @@
+from binance import Client, ThreadedWebsocketManager
+from binance.enums import *
+import pandas as pd
+import numpy as np
+import time
+import logging
+import pandas_ta as ta
+import optuna
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from datetime import datetime, timedelta
+import requests
+import json
+import os
+from typing import Dict, List, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# ================= CONFIGURACIÓN INICIAL =================
+# Crear directorio para datos si no existe
+if not os.path.exists('datos'):
+    os.makedirs('datos')
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('datos/trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# ================= CONFIGURACIÓN =================
+class Config:
+    # Configuración de Trading
+    MAX_OPERACIONES = 15
+    APALANCAMIENTO = 10
+    INTERVALO = Client.KLINE_INTERVAL_15MINUTE
+    VOLUMEN_MINIMO = 75000
+    RIESGO_TOTAL = 0.02
+    TIMEOUT_API = 25
+    REINTENTOS_API = 3
+    RSI_SOBRECOMPRA = 68
+    RSI_SOBREVENTA = 32
+    EMA_RAPIDA = 12
+    EMA_LENTA = 26
+    ATR_MULTIPLICADOR = 1.7
+    ADX_MINIMO = 28
+    MAX_DRAWDOWN_DIARIO = 0.06
+    PROFUNDIDAD_MINIMA = 150000
+    MODO = "PAPER"
+    TRAILING_STOP_MULTIPLICADOR = 2.0
+    TELEGRAM_BOT_TOKEN = "TU_BOT_TOKEN"
+    TELEGRAM_CHAT_ID = "TU_CHAT_ID"
+    
+    # Configuración IA
+    TAMANO_VENTANA = 60
+    TAMANO_LOTE = 128
+    TASA_APRENDIZAJE = 0.001
+    EPOCHS = 20
+
+# ================= MODELO LSTM MEJORADO =================
+class TradingLSTM(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int = 64, num_layers: int = 2):
+        super(TradingLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
+                           batch_first=True, bidirectional=True)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size*2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size*2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h0 = torch.zeros(self.num_layers*2, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers*2, x.size(0), self.hidden_size).to(x.device)
+        
+        out, _ = self.lstm(x, (h0, c0))
+        attention_weights = torch.softmax(self.attention(out), dim=1)
+        context = torch.sum(attention_weights * out, dim=1)
+        return self.fc(context)
+
+# ================= CLASE PRINCIPAL DEL BOT =================
+class AutoTradingBot:
+    def __init__(self, config: Config):
+        self.config = config
+        self.ARCHIVO_DATOS = os.path.join('datos', 'datos_historicos.csv')
+        self.client = self.inicializar_cliente()
+        self.symbols = self.actualizar_pares_validos()
+        self.balance = self.obtener_balance()
+        self.ultimo_balance_diario = self.balance
+        self.operaciones_activas: Dict = {}
+        self.historico_datos = self.cargar_datos_historicos()
+        self.dispositivo = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.modelo = self.inicializar_modelo().to(self.dispositivo)
+        self.optimizador = optim.Adam(self.modelo.parameters(), lr=config.TASA_APRENDIZAJE)
+        self.criterio = nn.BCELoss()
+        self.feature_mean = None
+        self.feature_std = None
+        self.iniciar_websocket()
+        self.ultimo_reentrenamiento = datetime.now()
+        
+    def inicializar_cliente(self) -> Client:
+        return Client(
+            api_key='9ad4d3bd57ba65697cd72cdc621830f19eeb82a9d4af6a32eb4d6ac3f3b9153c',
+            api_secret='5468490927c90954f56c8d47eb44eccbcb28f7fe9f160e2b57be6c84c72d7f1d',
+            testnet=(self.config.MODO == "PAPER"),
+            requests_params={'timeout': self.config.TIMEOUT_API}
+        )
+        
+    def actualizar_pares_validos(self) -> List[str]:
+        tickers = self.client.futures_ticker()
+        return [
+            t['symbol'] for t in tickers
+            if all([
+                float(t['quoteVolume']) > self.config.VOLUMEN_MINIMO,
+                float(t['volume']) > self.config.PROFUNDIDAD_MINIMA,
+                'USDT' in t['symbol']
+            ])
+        ]
+    
+    def obtener_balance(self) -> float:
+        balance = self.client.futures_account_balance()
+        return float(next(b for b in balance if b['asset'] == 'USDT')['balance'])
+    
+    def cargar_datos_historicos(self) -> pd.DataFrame:
+        try:
+            if os.path.exists(self.ARCHIVO_DATOS):
+                historico = pd.read_csv(self.ARCHIVO_DATOS, parse_dates=['timestamp'])
+                nuevo = self.recopilar_datos_actuales()
+                combinado = pd.concat([historico, nuevo]).drop_duplicates()
+            else:
+                combinado = self.recopilar_datos_actuales()
+            
+            combinado.to_csv(self.ARCHIVO_DATOS, index=False)
+            return combinado
+            
+        except Exception as e:
+            logging.error(f"Error cargando datos históricos: {str(e)}")
+            return pd.DataFrame()
+    
+    def recopilar_datos_actuales(self) -> pd.DataFrame:
+        datos = []
+        for symbol in self.symbols:
+            try:
+                klines = self.client.futures_klines(
+                    symbol=symbol,
+                    interval=self.config.INTERVALO,
+                    limit=1000
+                )
+                df = pd.DataFrame(klines, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                    'taker_buy_quote', 'ignore'
+                ])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df['symbol'] = symbol
+                datos.append(df)
+            except Exception as e:
+                logging.error(f"Error obteniendo datos para {symbol}: {str(e)}")
+        return pd.concat(datos)
+    
+    def iniciar_websocket(self) -> None:
+        self.twm = ThreadedWebsocketManager()
+        self.twm.start()
+        for symbol in self.symbols:
+            self.twm.start_symbol_ticker_socket(
+                symbol=symbol,
+                callback=self.procesar_mensaje
+            )
+    
+    def procesar_mensaje(self, msg: Dict) -> None:
+        try:
+            symbol = msg['s']
+            precio = float(msg['c'])
+            
+            if self.verificar_drawdown():
+                self.enviar_alerta("🚨 Drawdown máximo alcanzado - Deteniendo operaciones")
+                return
+            
+            if symbol in self.operaciones_activas:
+                self.actualizar_stops(symbol, precio)
+                return
+                
+            señal = self.generar_senal(symbol, precio)
+            if señal:
+                self.ejecutar_operacion(symbol, señal)
+        except Exception as e:
+            logging.error(f"Error en procesar_mensaje: {str(e)}")
+            self.enviar_alerta(f"🚨 Error procesando mensaje: {str(e)}")
+    
+    def verificar_drawdown(self) -> bool:
+        drawdown_actual = (self.balance - self.ultimo_balance_diario) / self.ultimo_balance_diario
+        return drawdown_actual <= -self.config.MAX_DRAWDOWN_DIARIO
+    
+    def inicializar_modelo(self) -> TradingLSTM:
+        try:
+            modelo = TradingLSTM(input_size=5)
+            modelo.load_state_dict(torch.load('datos/mejor_modelo.pth'))
+            return modelo
+        except FileNotFoundError:
+            return self.entrenar_modelo()
+    
+    def entrenar_modelo(self) -> None:
+        try:
+            X, y = self.preparar_datos_entrenamiento()
+            
+            # Calcular estadísticas de normalización
+            self.feature_mean = X.mean(dim=(0,1))
+            self.feature_std = X.std(dim=(0,1)) + 1e-8
+            
+            # Normalizar datos
+            X = (X - self.feature_mean) / self.feature_std
+            
+            dataset = TensorDataset(X, y)
+            dataloader = DataLoader(dataset, batch_size=self.config.TAMANO_LOTE, shuffle=True)
+            
+            self.modelo.train()
+            for epoch in range(self.config.EPOCHS):
+                for batch_X, batch_y in dataloader:
+                    batch_X, batch_y = batch_X.to(self.dispositivo), batch_y.to(self.dispositivo)
+                    self.optimizador.zero_grad()
+                    outputs = self.modelo(batch_X)
+                    loss = self.criterio(outputs, batch_y)
+                    loss.backward()
+                    self.optimizador.step()
+                self.enviar_alerta(f"✅ Entrenamiento Epoch {epoch+1} - Pérdida: {loss.item():.4f}")
+            
+            torch.save(self.modelo.state_dict(), 'datos/mejor_modelo.pth')
+            torch.save({'mean': self.feature_mean, 'std': self.feature_std}, 'datos/normalizacion.pth')
+        except Exception as e:
+            logging.error(f"Error entrenando modelo: {str(e)}")
+            self.enviar_alerta(f"❌ Error entrenando modelo: {str(e)}")
+    
+    def preparar_datos_entrenamiento(self) -> tuple:
+        secuencias = []
+        objetivos = []
+        for symbol, group in self.historico_datos.groupby('symbol'):
+            precios = group['close'].astype(float).values
+            features = self.calcular_indicadores(group)
+            for i in range(self.config.TAMANO_VENTANA, len(features)):
+                secuencia = features[i-self.config.TAMANO_VENTANA:i]
+                objetivo = 1 if precios[i] > precios[i-1] else 0
+                secuencias.append(secuencia)
+                objetivos.append(objetivo)
+        
+        X = torch.tensor(secuencias, dtype=torch.float32)
+        y = torch.tensor(objetivos, dtype=torch.float32).unsqueeze(1)
+        return X, y
+    
+    def calcular_indicadores(self, df: pd.DataFrame) -> np.ndarray:
+        try:
+            df['rsi'] = ta.rsi(df['close'], length=14)
+            df['ema_rapida'] = ta.ema(df['close'], length=self.config.EMA_RAPIDA)
+            df['ema_lenta'] = ta.ema(df['close'], length=self.config.EMA_LENTA)
+            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            df['adx'] = ta.adx(df['high'], df['low'], df['close'], length=14)['ADX_14']
+            return df[['rsi', 'ema_rapida', 'ema_lenta', 'atr', 'adx']].values
+        except Exception as e:
+            logging.error(f"Error calculando indicadores: {str(e)}")
+            return np.zeros((len(df), 5))
+    
+    def generar_senal(self, symbol: str, precio: float) -> Optional[Dict]:
+        try:
+            df = self.obtener_datos_en_tiempo_real(symbol)
+            if len(df) < self.config.TAMANO_VENTANA:
+                return None
+                
+            features = self.calcular_indicadores(df)
+            
+            # Cargar parámetros de normalización
+            if self.feature_mean is None:
+                norm_data = torch.load('datos/normalizacion.pth')
+                self.feature_mean = norm_data['mean']
+                self.feature_std = norm_data['std']
+            
+            # Normalizar características
+            features = (features - self.feature_mean.numpy()) / self.feature_std.numpy()
+            
+            entrada = torch.tensor(features[-self.config.TAMANO_VENTANA:], dtype=torch.float32)
+            entrada = entrada.unsqueeze(0).to(self.dispositivo)
+            
+            with torch.no_grad():
+                self.modelo.eval()
+                prediccion = self.modelo(entrada).item()
+            
+            if prediccion > 0.65:
+                return self.preparar_orden(symbol, 'BUY', precio, df)
+            elif prediccion < 0.35:
+                return self.preparar_orden(symbol, 'SELL', precio, df)
+            return None
+        except Exception as e:
+            logging.error(f"Error generando señal: {str(e)}")
+            return None
+    
+    def preparar_orden(self, symbol: str, tipo: str, precio: float, df: pd.DataFrame) -> Dict:
+        try:
+            atr = df['atr'].iloc[-1]
+            tamaño = (self.balance * self.config.RIESGO_TOTAL) / (self.config.ATR_MULTIPLICADOR * atr)
+            return {
+                'symbol': symbol,
+                'tipo': tipo,
+                'precio': precio,
+                'tamaño': round(tamaño, 3),
+                'stop_loss': precio - (atr * self.config.ATR_MULTIPLICADOR * (-1 if tipo == 'SELL' else 1)),
+                'take_profit': precio + (atr * self.config.ATR_MULTIPLICADOR * 2 * (1 if tipo == 'SELL' else -1))
+            }
+        except Exception as e:
+            logging.error(f"Error preparando orden: {str(e)}")
+            return None
+    
+    @retry(stop=stop_after_attempt(Config.REINTENTOS_API), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def ejecutar_operacion(self, symbol: str, orden: Dict) -> None:
+        try:
+            self.client.futures_change_leverage(
+                symbol=symbol,
+                leverage=self.config.APALANCAMIENTO
+            )
+            
+            orden_principal = self.client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_BUY if orden['tipo'] == 'BUY' else SIDE_SELL,
+                type=FUTURE_ORDER_TYPE_MARKET,
+                quantity=orden['tamaño']
+            )
+            
+            stop_order = self.client.futures_create_order(
+                symbol=symbol,
+                side=SIDE_SELL if orden['tipo'] == 'BUY' else SIDE_BUY,
+                type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                stopPrice=round(orden['stop_loss'], 2),
+                closePosition=True
+            )
+            
+            self.operaciones_activas[symbol] = {
+                'entrada': orden_principal,
+                'tipo': orden['tipo'],
+                'stop': orden['stop_loss'],
+                'take_profit': orden['take_profit'],
+                'timestamp': datetime.now(),
+                'stop_order_id': stop_order['orderId']
+            }
+            self.enviar_alerta(f"🚀 Nueva operación {orden['tipo']} en {symbol}")
+            
+        except Exception as e:
+            self.enviar_alerta(f"❌ Error ejecutando orden: {str(e)}")
+            logging.error(f"Error ejecutando orden: {str(e)}")
+            raise
+    
+    @retry(stop=stop_after_attempt(Config.REINTENTOS_API), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def actualizar_stops(self, symbol: str, precio: float) -> None:
+        try:
+            operacion = self.operaciones_activas[symbol]
+            nuevo_stop = precio + (precio - operacion['stop']) * 0.5
+            
+            if (operacion['tipo'] == 'BUY' and nuevo_stop > operacion['stop']) or \
+               (operacion['tipo'] == 'SELL' and nuevo_stop < operacion['stop']):
+                self.client.futures_cancel_order(
+                    symbol=symbol,
+                    orderId=operacion['stop_order_id']
+                )
+                
+                nueva_orden = self.client.futures_create_order(
+                    symbol=symbol,
+                    side=SIDE_SELL if operacion['tipo'] == 'BUY' else SIDE_BUY,
+                    type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                    stopPrice=round(nuevo_stop, 2),
+                    closePosition=True
+                )
+                
+                operacion['stop'] = nuevo_stop
+                operacion['stop_order_id'] = nueva_orden['orderId']
+        except Exception as e:
+            logging.error(f"Error actualizando stops: {str(e)}")
+            raise
+    
+    def enviar_alerta(self, mensaje: str) -> None:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={'chat_id': self.config.TELEGRAM_CHAT_ID, 'text': mensaje},
+                timeout=5
+            )
+        except Exception as e:
+            logging.error(f"Error enviando alerta: {str(e)}")
+
+# ================= EJECUCIÓN PRINCIPAL =================
+if __name__ == "__main__":
+    config = Config()
+    bot = None
+    
+    try:
+        bot = AutoTradingBot(config)
+        logging.info("Bot iniciado correctamente")
+        
+        while True:
+            if (datetime.now() - bot.ultimo_reentrenamiento).days >= 1:
+                bot.entrenar_modelo()
+                bot.ultimo_reentrenamiento = datetime.now()
+            
+            if datetime.now().weekday() == 6:
+                bot.symbols = bot.actualizar_pares_validos()
+            
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        if bot: 
+            bot.enviar_alerta("🔴 Bot detenido manualmente")
+            bot.twm.stop()
+        logging.info("Bot detenido manualmente")
+    except Exception as e:
+        error_msg = f"🚨 Error crítico: {str(e)}"
+        logging.critical(error_msg)
+        if bot:
+            bot.enviar_alerta(error_msg)
+        else:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                    data={'chat_id': config.TELEGRAM_CHAT_ID, 'text': error_msg},
+                    timeout=5
+                )
+            except: pass
+    finally:
+        if bot: 
+            bot.twm.stop()
+            logging.info("Conexiones WebSocket cerradas")
